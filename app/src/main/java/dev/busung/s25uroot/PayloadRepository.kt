@@ -102,8 +102,12 @@ class PayloadRepository(private val context: Context) {
     private fun rawUrl(commit: String, path: String) = "$RAW_REPOSITORY/$commit/$path"
 
     private fun pinArtifactUrl(url: String, commit: String): String {
-        require(url.startsWith(MUTABLE_RAW_PREFIX)) { context.getString(R.string.repo_url_invalid) }
-        return "$RAW_REPOSITORY/$commit/${url.removePrefix(MUTABLE_RAW_PREFIX)}"
+        val artifactPath = when {
+            url.startsWith(MUTABLE_RAW_PREFIX) -> url.removePrefix(MUTABLE_RAW_PREFIX)
+            url.startsWith(LEGACY_RAW_PREFIX) -> url.removePrefix(LEGACY_RAW_PREFIX)
+            else -> null
+        } ?: error(context.getString(R.string.repo_url_invalid))
+        return "$RAW_REPOSITORY/$commit/$artifactPath"
     }
 
     private fun downloadBytes(url: String, maximum: Int): ByteArray {
@@ -141,6 +145,8 @@ class PayloadRepository(private val context: Context) {
         private const val RAW_REPOSITORY =
             "https://raw.githubusercontent.com/adrielGGmotion/Root-My-Galaxy-Payloads"
         private const val MUTABLE_RAW_PREFIX = "$RAW_REPOSITORY/main/"
+        private const val LEGACY_RAW_PREFIX =
+            "https://raw.githubusercontent.com/BuSung-dev/Root-My-Galaxy-Payloads/main/"
         private const val MAX_COMMIT_RESPONSE_BYTES = 16 * 1024
         private const val MAX_MANIFEST_BYTES = 256 * 1024
     }
