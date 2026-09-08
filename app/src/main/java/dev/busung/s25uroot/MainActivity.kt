@@ -62,6 +62,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.CloudDownload
 import androidx.compose.material.icons.rounded.Code
 import androidx.compose.material.icons.rounded.BrightnessAuto
 import androidx.compose.material.icons.rounded.DarkMode
@@ -165,15 +166,27 @@ class MainActivity : ComponentActivity() {
     private var themeMode by mutableStateOf(AppThemeMode.System)
     private var advancedMode by mutableStateOf(false)
     private var shizukuMode by mutableStateOf(false)
+    private var autoRootEnabled by mutableStateOf(false)
+    private var autoRootAutoMode by mutableStateOf(false)
+
+    private val notificationPermission = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { _ -> }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        RootNotificationManager.createChannel(this)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
         window.isNavigationBarContrastEnforced = false
         accentColor = AppPreferences.accentColor(this)
         themeMode = AppPreferences.themeMode(this)
         advancedMode = AppPreferences.advancedMode(this)
         shizukuMode = AppPreferences.shizukuMode(this)
+        autoRootEnabled = AutoRootPreferences.isEnabled(this)
+        autoRootAutoMode = AutoRootPreferences.isAutoMode(this)
         setContent {
             RootMyGalaxyTheme(accentColor = accentColor, themeMode = themeMode) {
                 RootApp(
@@ -182,6 +195,8 @@ class MainActivity : ComponentActivity() {
                     themeMode = themeMode,
                     advancedMode = advancedMode,
                     shizukuMode = shizukuMode,
+                    autoRootEnabled = autoRootEnabled,
+                    autoRootAutoMode = autoRootAutoMode,
                     onAccentColorChanged = { color ->
                         AppPreferences.setAccentColor(this, color)
                         accentColor = color
@@ -197,6 +212,18 @@ class MainActivity : ComponentActivity() {
                     onShizukuModeChanged = { enabled ->
                         AppPreferences.setShizukuMode(this, enabled)
                         shizukuMode = enabled
+                    },
+                    onAutoRootEnabledChanged = { enabled ->
+                        AutoRootPreferences.setEnabled(this, enabled)
+                        autoRootEnabled = enabled
+                        if (!enabled) AutoRootPreferences.setAutoMode(this, false)
+                        autoRootAutoMode = if (!enabled) false else autoRootAutoMode
+                    },
+                    onAutoRootAutoModeChanged = { auto ->
+                        AutoRootPreferences.setAutoMode(this, auto)
+                        autoRootAutoMode = auto
+                        if (auto) AutoRootPreferences.setEnabled(this, true)
+                        if (auto) autoRootEnabled = true
                     },
                     openInstaller = { profileId ->
                         val installer = Intent(this, InstallActivity::class.java)
@@ -280,10 +307,14 @@ private fun RootApp(
     themeMode: AppThemeMode,
     advancedMode: Boolean,
     shizukuMode: Boolean,
+    autoRootEnabled: Boolean,
+    autoRootAutoMode: Boolean,
     onAccentColorChanged: (AccentColor) -> Unit,
     onThemeModeChanged: (AppThemeMode) -> Unit,
     onAdvancedModeChanged: (Boolean) -> Unit,
     onShizukuModeChanged: (Boolean) -> Unit,
+    onAutoRootEnabledChanged: (Boolean) -> Unit,
+    onAutoRootAutoModeChanged: (Boolean) -> Unit,
     openInstaller: (String?) -> Unit,
 ) {
     val installState by installViewModel.state.collectAsStateWithLifecycle()
@@ -332,7 +363,19 @@ private fun RootApp(
             }
         }
     }
-    LaunchedEffect(Unit) { checkForUpdate() }
+    LaunchedEffect(Unit) {
+        checkForUpdate()
+        scope.launch {
+            try {
+                val repo = PayloadRepository(context)
+                val status = repo.checkForUpdate()
+                if (status == PayloadRepository.UpdateStatus.UPDATE_AVAILABLE) {
+                    val profile = repo.resolveTarget(DeviceSnapshot.current())
+                    repo.download(profile) { }
+                }
+            } catch (_: Throwable) { }
+        }
+    }
 
     if (showTargetPicker) {
         TargetSelectionSheet(
@@ -503,6 +546,8 @@ private fun RootApp(
                     themeMode = themeMode,
                     advancedMode = advancedMode,
                     shizukuMode = shizukuMode,
+                    autoRootEnabled = autoRootEnabled,
+                    autoRootAutoMode = autoRootAutoMode,
                     updateStatus = updateStatus,
                     onCheckForUpdate = checkForUpdate,
                     onStartDownload = startDownload,
@@ -510,6 +555,8 @@ private fun RootApp(
                     onThemeModeChanged = onThemeModeChanged,
                     onAdvancedModeChanged = onAdvancedModeChanged,
                     onShizukuModeChanged = onShizukuModeChanged,
+                    onAutoRootEnabledChanged = onAutoRootEnabledChanged,
+                    onAutoRootAutoModeChanged = onAutoRootAutoModeChanged,
                 )
             }
         }
@@ -1406,6 +1453,8 @@ private fun SettingsPage(
     themeMode: AppThemeMode,
     advancedMode: Boolean,
     shizukuMode: Boolean,
+    autoRootEnabled: Boolean,
+    autoRootAutoMode: Boolean,
     updateStatus: UpdateStatus,
     onCheckForUpdate: () -> Unit,
     onStartDownload: (UpdateInfo) -> Unit,
@@ -1413,6 +1462,8 @@ private fun SettingsPage(
     onThemeModeChanged: (AppThemeMode) -> Unit,
     onAdvancedModeChanged: (Boolean) -> Unit,
     onShizukuModeChanged: (Boolean) -> Unit,
+    onAutoRootEnabledChanged: (Boolean) -> Unit,
+    onAutoRootAutoModeChanged: (Boolean) -> Unit,
 ) {
     val context = LocalContext.current
     val view = LocalView.current
@@ -1564,16 +1615,138 @@ private fun SettingsPage(
         }
         item { SectionLabel(stringResource(R.string.advanced)) }
         item {
-            SettingsSwitchCard(
-                icon = Icons.Rounded.Memory,
-                title = stringResource(R.string.advanced_mode),
-                description = stringResource(R.string.advanced_mode_description),
-                checked = advancedMode,
-                onCheckedChange = {
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                SettingsSwitchCard(
+                    icon = Icons.Rounded.Memory,
+                    title = stringResource(R.string.advanced_mode),
+                    description = stringResource(R.string.advanced_mode_description),
+                    checked = advancedMode,
+                    position = SettingsCardPosition.Top,
+                    onCheckedChange = {
+                        clickHaptic(view)
+                        onAdvancedModeChanged(it)
+                    },
+                )
+                SettingsSwitchCard(
+                    icon = Icons.Rounded.VerifiedUser,
+                    title = stringResource(R.string.auto_root_title),
+                    description = stringResource(R.string.auto_root_description),
+                    checked = autoRootEnabled,
+                    position = SettingsCardPosition.Middle,
+                    onCheckedChange = {
+                        clickHaptic(view)
+                        onAutoRootEnabledChanged(it)
+                    },
+                )
+                SettingsSwitchCard(
+                    icon = Icons.Rounded.BrightnessAuto,
+                    title = stringResource(R.string.auto_root_auto_mode_title),
+                    description = stringResource(R.string.auto_root_auto_mode_description),
+                    checked = autoRootAutoMode,
+                    position = SettingsCardPosition.Bottom,
+                    onCheckedChange = {
+                        clickHaptic(view)
+                        onAutoRootAutoModeChanged(it)
+                    },
+                )
+            }
+        }
+        item { SectionLabel(stringResource(R.string.payload_version_section)) }
+        item {
+            var preloading by remember { mutableStateOf(false) }
+            var preloadResult by remember { mutableStateOf<String?>(null) }
+            var payloadVersion by remember { mutableStateOf<String?>(null) }
+            var payloadUpdateStatus by remember { mutableStateOf<String?>(null) }
+            val repo = remember { PayloadRepository(context) }
+
+            LaunchedEffect(Unit) {
+                payloadVersion = repo.getCachedVersion() ?: context.getString(R.string.payload_version_unknown)
+            }
+            SettingsCard(
+                icon = Icons.Rounded.CloudDownload,
+                title = stringResource(R.string.payload_version),
+                description = stringResource(R.string.preload_description),
+                value = payloadVersion ?: "",
+                position = SettingsCardPosition.Top,
+                onClick = {
                     clickHaptic(view)
-                    onAdvancedModeChanged(it)
+                    if (!preloading) {
+                        preloading = true
+                        preloadResult = null
+                        payloadUpdateStatus = null
+                        scope.launch {
+                            try {
+                                val profile = repo.resolveTarget(DeviceSnapshot.current())
+                                repo.download(profile) { }
+                                val newVersion = repo.getCachedVersion()
+                                if (newVersion != null && newVersion != payloadVersion) {
+                                    payloadUpdateStatus = context.getString(R.string.payload_version_done)
+                                }
+                                payloadVersion = newVersion ?: payloadVersion
+                                preloadResult = context.getString(R.string.preload_done)
+                            } catch (e: Throwable) {
+                                preloadResult = context.getString(R.string.preload_failed) + ": " + (e.message ?: e::class.java.simpleName)
+                            }
+                            preloading = false
+                        }
+                    }
                 },
             )
+            SettingsCard(
+                icon = Icons.Rounded.SystemUpdate,
+                title = stringResource(R.string.payload_version_check_title),
+                description = stringResource(R.string.payload_version_check_description),
+                value = "",
+                position = SettingsCardPosition.Bottom,
+                onClick = {
+                    clickHaptic(view)
+                    payloadUpdateStatus = context.getString(R.string.payload_version_checking)
+                    scope.launch {
+                        try {
+                            val status = repo.checkForUpdate()
+                            payloadVersion = repo.getCachedVersion() ?: payloadVersion
+                            payloadUpdateStatus = when (status) {
+                                PayloadRepository.UpdateStatus.UP_TO_DATE ->
+                                    context.getString(R.string.payload_version_up_to_date)
+                                PayloadRepository.UpdateStatus.UPDATE_AVAILABLE ->
+                                    context.getString(R.string.payload_version_available)
+                                PayloadRepository.UpdateStatus.OFFLINE ->
+                                    context.getString(R.string.payload_version_offline)
+                            }
+                            if (status == PayloadRepository.UpdateStatus.UPDATE_AVAILABLE) {
+                                try {
+                                    val profile = repo.resolveTarget(DeviceSnapshot.current())
+                                    repo.download(profile) { }
+                                    payloadVersion = repo.getCachedVersion() ?: payloadVersion
+                                    payloadUpdateStatus = context.getString(R.string.payload_version_done)
+                                } catch (_: Throwable) {
+                                    payloadUpdateStatus = context.getString(R.string.payload_version_failed)
+                                }
+                            }
+                        } catch (e: Throwable) {
+                            payloadUpdateStatus = context.getString(R.string.payload_version_failed) + ": ${e.message}"
+                        }
+                    }
+                },
+            )
+            listOfNotNull(preloadResult, payloadUpdateStatus).takeIf { it.isNotEmpty() }?.let { results ->
+                results.forEach { result ->
+                    Text(
+                        text = result,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = when {
+                            result.startsWith(context.getString(R.string.preload_done)) ||
+                            result.startsWith(context.getString(R.string.payload_version_done)) ||
+                            result.startsWith(context.getString(R.string.payload_version_up_to_date)) ->
+                                MaterialTheme.colorScheme.primary
+                            result.startsWith(context.getString(R.string.payload_version_checking)) ->
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            else -> MaterialTheme.colorScheme.error
+                        },
+                        modifier = Modifier.padding(start = 18.dp, top = 4.dp),
+                    )
+                }
+            }
         }
         item { SectionLabel(stringResource(R.string.about)) }
         item {

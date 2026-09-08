@@ -19,29 +19,55 @@ class PayloadRepository(private val context: Context) {
     fun loadTargets(): List<TargetProfile> {
         val commit = resolveMainCommit()
         val manifestBytes = downloadBytes(rawUrl(commit, "support/targets-v3.json"), MAX_MANIFEST_BYTES)
+        cacheManifest(commit, manifestBytes)
         return SupportManifest.parse(manifestBytes).targets.map { profile -> profile.copy(
             exploit = profile.exploit.copy(url = pinArtifactUrl(profile.exploit.url, commit)),
             kernelSu = profile.kernelSu.copy(url = pinArtifactUrl(profile.kernelSu.url, commit)),
         ) }
     }
 
-    fun resolveTarget(snapshot: DeviceSnapshot): TargetProfile = loadTargets()
-        .firstOrNull { it.matches(snapshot) }
-        ?: error(context.getString(R.string.repo_no_profile))
+    fun loadTargetsOffline(): List<TargetProfile>? {
+        val cached = readCachedManifest() ?: return null
+        return SupportManifest.parse(cached.bytes).targets.map { profile -> profile.copy(
+            exploit = profile.exploit.copy(url = pinArtifactUrl(profile.exploit.url, cached.commit)),
+            kernelSu = profile.kernelSu.copy(url = pinArtifactUrl(profile.kernelSu.url, cached.commit)),
+        ) }
+    }
 
-    fun resolveTarget(profileId: String): TargetProfile = loadTargets()
-        .firstOrNull { it.profileId == profileId }
-        ?: error(context.getString(R.string.repo_profile_missing, profileId))
+    fun resolveTarget(snapshot: DeviceSnapshot): TargetProfile {
+        val online = try { loadTargets() } catch (_: Throwable) { null }
+        if (online != null) return online.firstOrNull { it.matches(snapshot) }
+            ?: error(context.getString(R.string.repo_no_profile))
+        val offline = loadTargetsOffline()
+            ?: error(context.getString(R.string.repo_no_profile))
+        return offline.firstOrNull { it.matches(snapshot) }
+            ?: error(context.getString(R.string.repo_no_profile))
+    }
+
+    fun resolveTarget(profileId: String): TargetProfile {
+        val online = try { loadTargets() } catch (_: Throwable) { null }
+        if (online != null) return online.firstOrNull { it.profileId == profileId }
+            ?: error(context.getString(R.string.repo_profile_missing, profileId))
+        val offline = loadTargetsOffline()
+            ?: error(context.getString(R.string.repo_profile_missing, profileId))
+        return offline.firstOrNull { it.profileId == profileId }
+            ?: error(context.getString(R.string.repo_profile_missing, profileId))
+    }
 
     fun download(profile: TargetProfile, onProgress: (String) -> Unit): VerifiedPayloads {
         val directory = File(context.filesDir, "payloads/${profile.profileId}").apply { mkdirs() }
-        val exploit = downloadArtifact(
-            profile.exploit,
-            File(directory, "cve-2026-43499-app.so"),
-            context.getString(R.string.artifact_exploit),
-            onProgress,
-        )
-        val kernelSu = downloadArtifact(
+        val exploit = if (profile.profileId == "testing-a55" && TESTING_PAYLOAD.exists()) {
+            onProgress("Using local testing payload")
+            copyTestingPayload(TESTING_PAYLOAD, File(directory, "cve-2026-43499-app.so"))
+        } else {
+            downloadOrUseCached(
+                profile.exploit,
+                File(directory, "cve-2026-43499-app.so"),
+                context.getString(R.string.artifact_exploit),
+                onProgress,
+            )
+        }
+        val kernelSu = downloadOrUseCached(
             profile.kernelSu,
             File(directory, "ksud-s25u-kdp"),
             context.getString(R.string.artifact_kernelsu),
@@ -51,6 +77,86 @@ class PayloadRepository(private val context: Context) {
         Os.chmod(kernelSu.absolutePath, 0b100100100)
         return VerifiedPayloads(profile, exploit, kernelSu)
     }
+
+    fun hasCachedPayloads(profileId: String): Boolean {
+        val directory = File(context.filesDir, "payloads/$profileId")
+        return File(directory, "cve-2026-43499-app.so").exists() &&
+            File(directory, "ksud-s25u-kdp").exists()
+    }
+
+    fun getCachedPayloads(profile: TargetProfile): VerifiedPayloads {
+        val directory = File(context.filesDir, "payloads/${profile.profileId}")
+        val exploit = File(directory, "cve-2026-43499-app.so")
+        val kernelSu = File(directory, "ksud-s25u-kdp")
+        require(exploit.exists() && kernelSu.exists()) { "Cached payloads not found" }
+        return VerifiedPayloads(profile, exploit, kernelSu)
+    }
+
+    private fun downloadOrUseCached(
+        artifact: RemoteArtifact,
+        destination: File,
+        label: String,
+        onProgress: (String) -> Unit,
+    ): File {
+        if (destination.exists() && destination.length() == artifact.size) {
+            onProgress(context.getString(R.string.repo_using_cached, label))
+            return destination
+        }
+        return try {
+            downloadArtifact(artifact, destination, label, onProgress)
+        } catch (e: Throwable) {
+            if (destination.exists()) {
+                onProgress(context.getString(R.string.repo_using_cached, label))
+                destination
+            } else {
+                throw e
+            }
+        }
+    }
+
+    fun checkForUpdate(): UpdateStatus {
+        val cached = readCachedManifest() ?: return UpdateStatus.UPDATE_AVAILABLE
+        return try {
+            val url = "$RAW_REPOSITORY/main/support/targets-v3.json"
+            val latestBytes = downloadBytes(url, MAX_MANIFEST_BYTES)
+            if (!latestBytes.contentEquals(cached.bytes)) {
+                try {
+                    val commit = resolveMainCommit()
+                    cacheManifest(commit, latestBytes)
+                } catch (_: Throwable) {
+                    cacheManifest("main", latestBytes)
+                }
+                UpdateStatus.UPDATE_AVAILABLE
+            } else {
+                UpdateStatus.UP_TO_DATE
+            }
+        } catch (_: Throwable) {
+            UpdateStatus.OFFLINE
+        }
+    }
+
+    fun getCachedVersion(): String? {
+        val cached = readCachedManifest() ?: return null
+        return cached.commit.take(8)
+    }
+
+    private fun cacheManifest(commit: String, bytes: ByteArray) {
+        val dir = File(context.filesDir, "cache").apply { mkdirs() }
+        File(dir, "manifest_commit.txt").writeText(commit)
+        File(dir, "manifest.json").writeBytes(bytes)
+    }
+
+    private fun readCachedManifest(): CachedManifest? {
+        val dir = File(context.filesDir, "cache")
+        val commitFile = File(dir, "manifest_commit.txt")
+        val manifestFile = File(dir, "manifest.json")
+        if (!commitFile.exists() || !manifestFile.exists()) return null
+        return CachedManifest(commitFile.readText().trim(), manifestFile.readBytes())
+    }
+
+    private data class CachedManifest(val commit: String, val bytes: ByteArray)
+
+    enum class UpdateStatus { UP_TO_DATE, UPDATE_AVAILABLE, OFFLINE }
 
     private fun downloadArtifact(
         artifact: RemoteArtifact,
@@ -139,7 +245,14 @@ class PayloadRepository(private val context: Context) {
             require(responseCode == HttpURLConnection.HTTP_OK) { "HTTP $responseCode" }
         }
 
+    private fun copyTestingPayload(src: File, dst: File): File {
+        if (dst.exists()) dst.delete()
+        src.copyTo(dst)
+        return dst
+    }
+
     companion object {
+        private val TESTING_PAYLOAD = File("/data/local/tmp/cve-2026-43499-app.so")
         private const val COMMIT_API_URL =
             "https://api.github.com/repos/axolot33l/Root-My-Galaxy-Payloads/git/ref/heads/main"
         private const val RAW_REPOSITORY =
